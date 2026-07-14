@@ -4,7 +4,9 @@ param(
     [string]$Slug = "kodiremote",
     [string]$Title = "Kodi Remote",
     [string]$Device = "tanmatsu",
-    [string]$BadgeLinkDir = "badgelink_v020"
+    [string]$EspIdfPath = "C:\espressif\esp-idf-v5.5.1",
+    [string]$IdfToolsPath = "C:\espressif\esp-idf-tools",
+    [string]$BadgeLinkDir = "C:\espressif\badgelink_v020"
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,14 +25,15 @@ if (-not $NoBuild) {
     Invoke-Step "Build firmware ($Device)" {
         $env:PYTHONIOENCODING = "utf-8"
         $env:PYTHONUTF8       = "1"
-        $env:IDF_TOOLS_PATH   = Join-Path $repoRoot "esp-idf-tools"
+        $env:IDF_TOOLS_PATH   = $IdfToolsPath
         [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 
-        if (-not (Test-Path ".\esp-idf\export.ps1")) {
-            throw "ESP-IDF not found at .\esp-idf. Run the SDK setup first (see COMMANDS.md)."
+        $exportScript = Join-Path $EspIdfPath "export.ps1"
+        if (-not (Test-Path $exportScript)) {
+            throw "ESP-IDF not found at $EspIdfPath. Pass -EspIdfPath if it lives somewhere else."
         }
 
-        . .\esp-idf\export.ps1
+        . $exportScript
 
         idf.py --no-ccache -B "build/$Device" build `
             -DDEVICE=$Device `
@@ -50,9 +53,9 @@ if (-not (Test-Path $firmwarePath)) {
     throw "Firmware binary not found at $firmwarePath. Build the app first (omit -NoBuild)."
 }
 
-$badgeLinkTools = Join-Path $repoRoot "$BadgeLinkDir\tools"
+$badgeLinkTools = Join-Path $BadgeLinkDir "tools"
 if (-not (Test-Path (Join-Path $badgeLinkTools "badgelink.py"))) {
-    throw "BadgeLink tooling not found at $badgeLinkTools. Clone it first: git clone https://github.com/badgeteam/esp32-component-badgelink.git $BadgeLinkDir"
+    throw "BadgeLink tooling not found at $badgeLinkTools. Pass -BadgeLinkDir if it lives somewhere else, or clone it: git clone https://github.com/badgeteam/esp32-component-badgelink.git $BadgeLinkDir"
 }
 
 $venvDir    = Join-Path $badgeLinkTools ".venv"
