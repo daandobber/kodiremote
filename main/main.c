@@ -59,11 +59,21 @@ static void enter_screen(app_screen_t screen);  // forward decl, defined below i
 static app_screen_t    current_screen = SCREEN_MENU;
 static kodi_settings_t settings       = {0};
 
-static bool           kodi_reachable  = false;
-static kodi_status_t  status          = {0};
-static bool           status_valid    = false;
-static int64_t        last_poll_us    = 0;
+// Guards kodi_reachable/status/status_valid: written by status_poll_task,
+// read by the UI thread's draw functions. Polling used to run a blocking
+// HTTP call directly on the UI/input thread - if Kodi was slow to answer
+// (up to KODI_HTTP_TIMEOUT_MS), the whole app froze for that long, every
+// POLL_INTERVAL_US, for as long as the Remote screen was open.
+static SemaphoreHandle_t status_mutex          = NULL;
+static bool              kodi_reachable        = false;
+static kodi_status_t     status                = {0};
+static bool              status_valid          = false;
+static int64_t           last_poll_us          = 0;
 #define POLL_INTERVAL_US (2000 * 1000)
+
+static SemaphoreHandle_t status_poll_request_sem = NULL;  // binary; given to ask the worker for one more poll
+static TaskHandle_t      status_poll_task_handle = NULL;
+static volatile uint32_t status_result_generation = 0;    // bumped by the worker each time it applies a result
 
 // Menu screen state
 #define MENU_ITEM_COUNT 5
@@ -103,6 +113,36 @@ static int                  lib_item_count  = 0;
 static int                  lib_selected    = 0;
 static int                  lib_scroll      = 0;
 static char                 lib_message[64] = "";
+static bool                  lib_loading     = false;  // UI-thread-only: a listing fetch is outstanding
+
+// Listing fetches (movies/tvshows/seasons/episodes/artists/albums) used to
+// call straight into kodi_library_get_*() on the UI/input thread - a
+// blocking HTTP round trip on every push/pop through the library, freezing
+// input handling for however long Kodi took to answer. Moved to a worker
+// task using the same request-id/overwrite-queue pattern as the preview
+// fetch below: lib_dispatch_load() only ever queues the *latest* desired
+// listing, and a result whose request_id no longer matches gets discarded.
+typedef struct {
+    lib_view_t view;
+    int        tvshowid;
+    int        season;
+    int        artistid;
+    uint32_t   request_id;
+} lib_load_job_t;
+
+typedef struct {
+    kodi_library_item_t* items;
+    int                   count;
+    esp_err_t             err;
+    uint32_t              request_id;
+} lib_load_result_t;
+
+static QueueHandle_t     lib_load_job_queue      = NULL;  // depth 1, xQueueOverwrite
+static TaskHandle_t      lib_load_task           = NULL;
+static SemaphoreHandle_t lib_load_result_mutex   = NULL;  // guards lib_load_pending_result/lib_load_pending_valid
+static lib_load_result_t lib_load_pending_result;
+static volatile bool     lib_load_pending_valid  = false;
+static volatile uint32_t lib_load_request_id     = 0;     // bumped whenever the desired listing changes
 
 // A single big preview image + description is shown for whichever row is
 // currently selected (not one thumbnail per row) - much cheaper, and matches
@@ -346,6 +386,24 @@ static void lib_reset_preview(void) {
 static void lib_free_items(void) {
     lib_reset_preview();
 
+    // Invalidate any in-flight listing fetch for the level we're leaving -
+    // lib_load_worker_task checks this id and discards a result that no
+    // longer matches once it finishes. A result that had *already* finished
+    // and was waiting to be picked up (e.g. the user left the Library screen
+    // entirely before lib_poll_load_result() ever ran) is freed right here
+    // instead, so it can't sit allocated until some unrelated later fetch
+    // happens to overwrite it.
+    lib_load_request_id++;
+    lib_loading = false;
+    if (lib_load_result_mutex != NULL) {
+        xSemaphoreTake(lib_load_result_mutex, portMAX_DELAY);
+        if (lib_load_pending_valid) {
+            kodi_library_free_items(lib_load_pending_result.items);
+            lib_load_pending_valid = false;
+        }
+        xSemaphoreGive(lib_load_result_mutex);
+    }
+
     if (lib_items) {
         kodi_library_free_items(lib_items);
         lib_items = NULL;
@@ -355,58 +413,107 @@ static void lib_free_items(void) {
     lib_scroll     = 0;
 }
 
-// Draws a small "Loading ..." placeholder immediately, since the fetch below
-// blocks on a network round trip and would otherwise leave the screen frozen
-// on the previous view.
-static void lib_show_loading(char const* what) {
-    pax_background(&fb, BLACK);
-    char msg[64];
-    snprintf(msg, sizeof(msg), "Loading %s...", what);
-    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 12, 50, msg);
-    blit();
+static char const* lib_view_label(lib_view_t view) {
+    switch (view) {
+        case LIB_VIEW_MOVIES: return "movies";
+        case LIB_VIEW_TVSHOWS: return "TV shows";
+        case LIB_VIEW_SEASONS: return "seasons";
+        case LIB_VIEW_EPISODES: return "episodes";
+        case LIB_VIEW_ARTISTS: return "artists";
+        case LIB_VIEW_ALBUMS: return "albums";
+    }
+    return "";
 }
 
-static void lib_load_current(void) {
+// Runs the blocking Kodi fetch off the UI/input thread. Only ever processes
+// the *latest* dispatched job (depth-1 xQueueOverwrite queue): if the user
+// pushes/pops again before this finishes, the stale result is freed instead
+// of applied once request_id no longer matches.
+static void lib_load_worker_task(void* arg) {
+    (void)arg;
+    lib_load_job_t job;
+    while (1) {
+        if (xQueueReceive(lib_load_job_queue, &job, portMAX_DELAY) != pdTRUE) continue;
+
+        kodi_library_item_t* items = NULL;
+        int                   count = 0;
+        esp_err_t             err   = ESP_FAIL;
+
+        switch (job.view) {
+            case LIB_VIEW_MOVIES: err = kodi_library_get_movies(&items, &count); break;
+            case LIB_VIEW_TVSHOWS: err = kodi_library_get_tvshows(&items, &count); break;
+            case LIB_VIEW_SEASONS: err = kodi_library_get_seasons(job.tvshowid, &items, &count); break;
+            case LIB_VIEW_EPISODES: err = kodi_library_get_episodes(job.tvshowid, job.season, &items, &count); break;
+            case LIB_VIEW_ARTISTS: err = kodi_library_get_artists(&items, &count); break;
+            case LIB_VIEW_ALBUMS: err = kodi_library_get_albums(job.artistid, &items, &count); break;
+        }
+
+        xSemaphoreTake(lib_load_result_mutex, portMAX_DELAY);
+        if (lib_load_pending_valid) {
+            kodi_library_free_items(lib_load_pending_result.items);  // UI thread never consumed the previous one
+        }
+        lib_load_pending_result = (lib_load_result_t){.items = items, .count = count, .err = err,
+                                                        .request_id = job.request_id};
+        lib_load_pending_valid  = true;
+        xSemaphoreGive(lib_load_result_mutex);
+    }
+}
+
+// Queues a fetch for whatever lib_stack[lib_depth-1] currently points to.
+// Non-blocking: returns immediately, the result is picked up later by
+// lib_poll_load_result() once the worker task finishes.
+static void lib_dispatch_load(void) {
     lib_free_items();
     if (lib_depth == 0) return;  // root view uses the static lib_root_items list
 
-    lib_frame_t* f   = &lib_stack[lib_depth - 1];
-    esp_err_t    err = ESP_FAIL;
+    lib_frame_t* f = &lib_stack[lib_depth - 1];
+    lib_load_request_id++;
+    lib_loading = true;
 
-    switch (f->view) {
-        case LIB_VIEW_MOVIES:
-            lib_show_loading("movies");
-            err = kodi_library_get_movies(&lib_items, &lib_item_count);
-            break;
-        case LIB_VIEW_TVSHOWS:
-            lib_show_loading("TV shows");
-            err = kodi_library_get_tvshows(&lib_items, &lib_item_count);
-            break;
-        case LIB_VIEW_SEASONS:
-            lib_show_loading("seasons");
-            err = kodi_library_get_seasons(f->tvshowid, &lib_items, &lib_item_count);
-            break;
-        case LIB_VIEW_EPISODES:
-            lib_show_loading("episodes");
-            err = kodi_library_get_episodes(f->tvshowid, f->season, &lib_items, &lib_item_count);
-            break;
-        case LIB_VIEW_ARTISTS:
-            lib_show_loading("artists");
-            err = kodi_library_get_artists(&lib_items, &lib_item_count);
-            break;
-        case LIB_VIEW_ALBUMS:
-            lib_show_loading("albums");
-            err = kodi_library_get_albums(f->artistid, &lib_items, &lib_item_count);
-            break;
+    lib_load_job_t job = {
+        .view = f->view, .tvshowid = f->tvshowid, .season = f->season, .artistid = f->artistid,
+        .request_id = lib_load_request_id,
+    };
+    if (lib_load_job_queue != NULL) xQueueOverwrite(lib_load_job_queue, &job);
+}
+
+// Applies a completed listing fetch to lib_items/lib_item_count if one is
+// waiting and still relevant. Cheap to call every main-loop tick. Returns
+// true if it actually applied a result (the caller should redraw).
+static bool lib_poll_load_result(void) {
+    if (!lib_loading || lib_load_result_mutex == NULL) return false;
+
+    lib_load_result_t result;
+    bool               consumed = false;
+
+    xSemaphoreTake(lib_load_result_mutex, portMAX_DELAY);
+    if (lib_load_pending_valid) {
+        if (lib_load_pending_result.request_id == lib_load_request_id) {
+            result   = lib_load_pending_result;
+            consumed = true;
+        } else {
+            kodi_library_free_items(lib_load_pending_result.items);  // stale - selection moved on
+        }
+        lib_load_pending_valid = false;
     }
+    xSemaphoreGive(lib_load_result_mutex);
 
-    if (err != ESP_OK) {
+    if (!consumed) return false;
+
+    lib_items      = result.items;
+    lib_item_count = result.count;
+    lib_selected   = 0;
+    lib_scroll     = 0;
+    lib_loading    = false;
+
+    if (result.err != ESP_OK) {
         snprintf(lib_message, sizeof(lib_message), "Failed to load from Kodi");
     } else if (lib_item_count == 0) {
         snprintf(lib_message, sizeof(lib_message), "Nothing found");
     } else {
         lib_message[0] = '\0';
     }
+    return true;
 }
 
 // Dispatches a background fetch for the currently selected row's preview
@@ -445,7 +552,7 @@ static void lib_push(lib_view_t view, int tvshowid, int season, int artistid, ch
     f->artistid    = artistid;
     snprintf(f->title, sizeof(f->title), "%s", title ? title : "");
     lib_selected = 0;
-    lib_load_current();
+    lib_dispatch_load();
 }
 
 static void lib_pop(void) {
@@ -455,7 +562,7 @@ static void lib_pop(void) {
     }
     lib_depth--;
     lib_selected = 0;
-    lib_load_current();
+    lib_dispatch_load();
 }
 
 // ---- Download / bulk pre-cache ----
@@ -533,7 +640,11 @@ static void draw_header(char const* title) {
     pax_simple_rect(&fb, DARKGREY, 0, 0, w, 36);
     pax_draw_text(&fb, WHITE, pax_font_saira_regular, 22, 10, 6, title);
 
-    pax_col_t dot_color = kodi_reachable ? GREEN : RED;
+    xSemaphoreTake(status_mutex, portMAX_DELAY);
+    bool reachable = kodi_reachable;
+    xSemaphoreGive(status_mutex);
+
+    pax_col_t dot_color = reachable ? GREEN : RED;
     pax_simple_rect(&fb, dot_color, w - 24, 12, 12, 12);
 }
 
@@ -561,11 +672,17 @@ static void draw_menu_screen(void) {
         y += row_h;
     }
 
-    if (status_valid && status.playing) {
+    xSemaphoreTake(status_mutex, portMAX_DELAY);
+    bool          reachable    = kodi_reachable;
+    bool          valid        = status_valid;
+    kodi_status_t status_copy  = status;
+    xSemaphoreGive(status_mutex);
+
+    if (valid && status_copy.playing) {
         char line[160];
-        snprintf(line, sizeof(line), "Now playing: %s", status.title[0] ? status.title : "(unknown)");
+        snprintf(line, sizeof(line), "Now playing: %s", status_copy.title[0] ? status_copy.title : "(unknown)");
         pax_draw_text(&fb, YELLOW, pax_font_sky_mono, 14, 12, y + 8, line);
-    } else if (!kodi_reachable && kodi_client_is_configured()) {
+    } else if (!reachable && kodi_client_is_configured()) {
         pax_draw_text(&fb, RED, pax_font_sky_mono, 14, 12, y + 8, "Kodi host unreachable - check Settings");
     } else if (!kodi_client_is_configured()) {
         pax_draw_text(&fb, YELLOW, pax_font_sky_mono, 14, 12, y + 8, "Not configured yet - open Settings");
@@ -601,41 +718,47 @@ static void draw_remote_screen(void) {
     pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, cx + pad + 4, cy - 8, ">");
     pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, cx - 12, cy - 8, "OK");
 
+    xSemaphoreTake(status_mutex, portMAX_DELAY);
+    bool          reachable    = kodi_reachable;
+    bool          valid        = status_valid;
+    kodi_status_t status_copy  = status;
+    xSemaphoreGive(status_mutex);
+
     float info_y = cy + pad + 40;
     if (!kodi_client_is_configured()) {
         pax_draw_text(&fb, RED, pax_font_sky_mono, 16, 12, info_y, "No Kodi host configured (see Settings)");
-    } else if (!kodi_reachable) {
+    } else if (!reachable) {
         pax_draw_text(&fb, RED, pax_font_sky_mono, 16, 12, info_y, "Kodi host unreachable");
-    } else if (status_valid && status.playing) {
+    } else if (valid && status_copy.playing) {
         char title_line[160];
-        snprintf(title_line, sizeof(title_line), "%s", status.title[0] ? status.title : "(unknown title)");
+        snprintf(title_line, sizeof(title_line), "%s", status_copy.title[0] ? status_copy.title : "(unknown title)");
         pax_draw_text(&fb, WHITE, pax_font_saira_regular, 18, 12, info_y, title_line);
 
-        if (status.subtitle[0]) {
-            pax_draw_text(&fb, GREY, pax_font_sky_mono, 14, 12, info_y + 24, status.subtitle);
+        if (status_copy.subtitle[0]) {
+            pax_draw_text(&fb, GREY, pax_font_sky_mono, 14, 12, info_y + 24, status_copy.subtitle);
         }
 
         // Progress bar
         float bar_x = 12, bar_y = info_y + 48, bar_w = w - 24, bar_h = 10;
         pax_outline_rect(&fb, GREY, bar_x, bar_y, bar_w, bar_h);
-        float fill = bar_w * (float)(status.percentage / 100.0);
+        float fill = bar_w * (float)(status_copy.percentage / 100.0);
         if (fill > bar_w) fill = bar_w;
         if (fill < 0) fill = 0;
         pax_simple_rect(&fb, GREEN, bar_x, bar_y, fill, bar_h);
 
         char cur[16], tot[16], time_line[48];
-        format_time(cur, sizeof(cur), status.time_hours, status.time_minutes, status.time_seconds);
-        format_time(tot, sizeof(tot), status.total_hours, status.total_minutes, status.total_seconds);
-        snprintf(time_line, sizeof(time_line), "%s / %s%s", cur, tot, status.paused ? "  (paused)" : "");
+        format_time(cur, sizeof(cur), status_copy.time_hours, status_copy.time_minutes, status_copy.time_seconds);
+        format_time(tot, sizeof(tot), status_copy.total_hours, status_copy.total_minutes, status_copy.total_seconds);
+        snprintf(time_line, sizeof(time_line), "%s / %s%s", cur, tot, status_copy.paused ? "  (paused)" : "");
         pax_draw_text(&fb, GREY, pax_font_sky_mono, 14, 12, bar_y + 16, time_line);
 
         char vol_line[48];
-        snprintf(vol_line, sizeof(vol_line), "Volume: %d%%%s", status.volume, status.muted ? " (muted)" : "");
+        snprintf(vol_line, sizeof(vol_line), "Volume: %d%%%s", status_copy.volume, status_copy.muted ? " (muted)" : "");
         pax_draw_text(&fb, GREY, pax_font_sky_mono, 14, 12, bar_y + 36, vol_line);
     } else {
         char vol_line[48];
-        snprintf(vol_line, sizeof(vol_line), "Nothing playing. Volume: %d%%%s", status.volume,
-                 status.muted ? " (muted)" : "");
+        snprintf(vol_line, sizeof(vol_line), "Nothing playing. Volume: %d%%%s", status_copy.volume,
+                 status_copy.muted ? " (muted)" : "");
         pax_draw_text(&fb, GREY, pax_font_sky_mono, 16, 12, info_y, vol_line);
     }
 
@@ -701,6 +824,15 @@ static void draw_library_screen(void) {
     float h         = pax_buf_get_height(&fb);
     float top       = 44;
     bool  has_media = lib_depth != 0;
+
+    if (lib_depth != 0 && lib_loading) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Loading %s...", lib_view_label(lib_stack[lib_depth - 1].view));
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 12, top + 8, msg);
+        draw_footer_hints("Esc back  F2 menu");
+        blit();
+        return;
+    }
 
     int count = (lib_depth == 0) ? 3 : lib_item_count;
 
@@ -932,22 +1064,42 @@ static void render(void) {
 
 // ---- Status polling ----
 
-static void poll_kodi_status(void) {
-    if (!kodi_client_is_configured()) {
-        kodi_reachable = false;
-        status_valid   = false;
-        return;
-    }
+// Runs the blocking kodi_get_status() HTTP call off the UI/input thread.
+// Waits on a binary semaphore instead of its own timer so it stays purely
+// reactive - the main loop (still the one that knows the 2s cadence, screen
+// transitions, and F3) decides *when* a poll is wanted via poll_kodi_status()
+// below; this task only ever does the actual network round trip.
+static void status_poll_task(void* arg) {
+    (void)arg;
+    while (1) {
+        if (xSemaphoreTake(status_poll_request_sem, portMAX_DELAY) != pdTRUE) continue;
 
-    kodi_status_t new_status;
-    esp_err_t     err = kodi_get_status(&new_status);
-    if (err == ESP_OK) {
-        status         = new_status;
-        status_valid   = true;
-        kodi_reachable = true;
-    } else {
-        kodi_reachable = false;
+        bool          configured = kodi_client_is_configured();
+        kodi_status_t new_status;
+        esp_err_t     err = configured ? kodi_get_status(&new_status) : ESP_FAIL;
+
+        xSemaphoreTake(status_mutex, portMAX_DELAY);
+        if (!configured) {
+            kodi_reachable = false;
+            status_valid   = false;
+        } else if (err == ESP_OK) {
+            status         = new_status;
+            status_valid   = true;
+            kodi_reachable = true;
+        } else {
+            kodi_reachable = false;
+        }
+        xSemaphoreGive(status_mutex);
+
+        status_result_generation++;
     }
+}
+
+// Non-blocking: asks the background task for one more poll. Safe to call as
+// often as the UI thread likes (2s cadence, F3, entering the Remote screen) -
+// if a poll is already pending/in-flight this is a harmless no-op wakeup.
+static void poll_kodi_status(void) {
+    if (status_poll_request_sem != NULL) xSemaphoreGive(status_poll_request_sem);
 }
 
 // ---- Input handling per screen ----
@@ -1293,9 +1445,15 @@ void app_main(void) {
     lib_preview_mutex     = xSemaphoreCreateMutex();
     lib_preview_job_queue = xQueueCreate(1, sizeof(lib_preview_job_t));
     xTaskCreate(lib_preview_worker_task, "kodi_thumb", 6144, NULL, tskIDLE_PRIORITY + 1, &lib_preview_task);
+    lib_load_result_mutex = xSemaphoreCreateMutex();
+    lib_load_job_queue    = xQueueCreate(1, sizeof(lib_load_job_t));
+    xTaskCreate(lib_load_worker_task, "kodi_lib", 6144, NULL, tskIDLE_PRIORITY + 1, &lib_load_task);
     download_state_mutex = xSemaphoreCreateMutex();
     kodi_command_queue   = xQueueCreate(KODI_COMMAND_QUEUE_DEPTH, sizeof(kodi_command_job_t));
     xTaskCreate(kodi_command_worker_task, "kodi_cmd", 4096, NULL, tskIDLE_PRIORITY + 1, &kodi_command_task);
+    status_mutex             = xSemaphoreCreateMutex();
+    status_poll_request_sem  = xSemaphoreCreateBinary();
+    xTaskCreate(status_poll_task, "kodi_status", 4096, NULL, tskIDLE_PRIORITY + 1, &status_poll_task_handle);
 
     esp_err_t res = nvs_flash_init();
     if (res == ESP_ERR_NVS_NO_FREE_PAGES || res == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -1380,12 +1538,18 @@ void app_main(void) {
 
     render();
 
+    uint32_t last_seen_status_generation = status_result_generation;
+
     while (1) {
         bsp_input_event_t event;
-        bool               wants_periodic_refresh = current_screen == SCREEN_REMOTE ||
-                                          (current_screen == SCREEN_DOWNLOAD && download_running);
-        TickType_t         wait_ticks = wants_periodic_refresh ? pdMS_TO_TICKS(300) : portMAX_DELAY;
-        BaseType_t         got_event  = xQueueReceive(input_event_queue, &event, wait_ticks);
+        // Always wake at a modest rate rather than portMAX_DELAY: status
+        // polls and library fetches now complete on background tasks, and
+        // this is how the main loop notices a result is ready (via the
+        // generation-counter/lib_loading checks below) without needing a
+        // keypress first. Waking up is cheap (a queue timeout plus a couple
+        // of integer checks) - it's redrawing that's expensive, and nothing
+        // here forces one unless something actually changed.
+        BaseType_t got_event = xQueueReceive(input_event_queue, &event, pdMS_TO_TICKS(300));
 
         // Every physical key press generates BOTH a press and a release
         // event; none of the handlers below act on a release (they all
@@ -1400,7 +1564,14 @@ void app_main(void) {
         // event - a backlog of N queued events used to mean N sequential
         // full-screen redraws before the display caught up to what the
         // user already did.
-        bool should_render = wants_periodic_refresh;
+        // Unlike the wake tick above, a plain timeout is only a reason to
+        // redraw on the download screen (its progress bar has no other way
+        // to visibly advance). On the remote screen, redrawing is driven
+        // entirely by actual input or a fresh status poll (below) - most
+        // 300ms wake-ups happen between polls and have nothing new to show,
+        // so forcing a full-screen redraw+blit for them was pure waste and
+        // the main source of this screen feeling laggy.
+        bool should_render = current_screen == SCREEN_DOWNLOAD && download_running;
         int  drained       = 0;
 
         while (got_event == pdTRUE) {
@@ -1445,10 +1616,23 @@ void app_main(void) {
         if (current_screen == SCREEN_REMOTE) {
             int64_t now = esp_timer_get_time();
             if (now - last_poll_us >= POLL_INTERVAL_US) {
-                poll_kodi_status();
+                poll_kodi_status();  // non-blocking dispatch; result picked up below once it lands
                 last_poll_us = now;
-                should_render = true;
             }
+        }
+
+        // Pick up a completed background status poll. Only the Remote and
+        // Menu screens display it (menu shows "Now playing"/reachability),
+        // so a poll finishing while e.g. Settings is open just updates the
+        // stored status silently - it'll show next time Remote/Menu render.
+        if (status_result_generation != last_seen_status_generation) {
+            last_seen_status_generation = status_result_generation;
+            if (current_screen == SCREEN_REMOTE || current_screen == SCREEN_MENU) should_render = true;
+        }
+
+        // Pick up a completed background library fetch.
+        if (current_screen == SCREEN_LIBRARY && lib_poll_load_result()) {
+            should_render = true;
         }
 
         if (should_render) render();
