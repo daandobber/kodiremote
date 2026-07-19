@@ -237,13 +237,15 @@ static settings_field_t settings_fields[SETTINGS_FIELD_COUNT];
 static int          settings_field_index = 0;
 static char const*  settings_status_line = "";
 
-// Display sleep only turns off the backlight; networking and Kodi status
-// updates keep running. The first key after sleep wakes the display and is
+// Display sleep turns off every user-facing light while networking and Kodi
+// status updates keep running. The first key wakes the lights and is
 // deliberately swallowed so it cannot accidentally control Kodi.
-static int64_t last_user_activity_us    = 0;
-static int64_t last_remote_render_us    = 0;
-static bool    display_asleep           = false;
-static uint8_t display_awake_brightness = 80;
+static int64_t last_user_activity_us       = 0;
+static int64_t last_remote_render_us       = 0;
+static bool    display_asleep              = false;
+static uint8_t display_awake_brightness    = 80;
+static uint8_t keyboard_awake_brightness   = 100;
+static uint8_t led_awake_brightness        = 100;
 
 // ---- Helpers ----
 
@@ -254,6 +256,19 @@ static void blit(void) {
     if (res != ESP_OK) {
         ESP_LOGE(TAG, "Failed to blit to display: %d", res);
     }
+}
+
+static void set_device_lights_asleep(bool asleep) {
+    esp_err_t res = bsp_display_set_backlight_brightness(asleep ? 0 : display_awake_brightness);
+    if (res != ESP_OK) ESP_LOGW(TAG, "Failed to set display backlight: %s", esp_err_to_name(res));
+
+    res = bsp_input_set_backlight_brightness(asleep ? 0 : keyboard_awake_brightness);
+    if (res != ESP_OK) ESP_LOGW(TAG, "Failed to set keyboard backlight: %s", esp_err_to_name(res));
+
+    // Changing global LED brightness preserves the current status colour, so
+    // it can be restored on wake without reconstructing the pixel state.
+    res = bsp_led_set_brightness(asleep ? 0 : led_awake_brightness);
+    if (res != ESP_OK) ESP_LOGW(TAG, "Failed to set LED brightness: %s", esp_err_to_name(res));
 }
 
 static void init_settings_fields(void) {
@@ -1689,6 +1704,12 @@ void app_main(void) {
         display_awake_brightness == 0) {
         display_awake_brightness = 80;
     }
+    if (bsp_input_get_backlight_brightness(&keyboard_awake_brightness) != ESP_OK) {
+        keyboard_awake_brightness = 100;
+    }
+    if (bsp_led_get_brightness(&led_awake_brightness) != ESP_OK) {
+        led_awake_brightness = 100;
+    }
 
     ESP_ERROR_CHECK(bsp_input_get_queue(&input_event_queue));
 
@@ -1785,7 +1806,7 @@ void app_main(void) {
                 if (display_asleep) {
                     display_asleep = false;
                     woke_display_this_batch = true;
-                    bsp_display_set_backlight_brightness(display_awake_brightness);
+                    set_device_lights_asleep(false);
                     should_render = true;
                 }
             }
@@ -1870,8 +1891,8 @@ void app_main(void) {
             now - last_user_activity_us >= (int64_t)settings.display_sleep_seconds * 1000000) {
             display_asleep = true;
             should_render  = false;
-            ESP_LOGI(TAG, "Display asleep after %u seconds", settings.display_sleep_seconds);
-            bsp_display_set_backlight_brightness(0);
+            ESP_LOGI(TAG, "Device lights asleep after %u seconds", settings.display_sleep_seconds);
+            set_device_lights_asleep(true);
         }
 
         if (should_render && !display_asleep) render();
