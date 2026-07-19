@@ -44,9 +44,10 @@ Kodi side beyond what Kodi already ships with.
   Kodi, or just quit Kodi.
 - Host, port and optional HTTP basic-auth credentials are entered on-device
   and stored in NVS, so they survive reboots.
-- Configurable automatic display sleep (`Off`, `30`, `60` or `90` seconds).
-  Kodi polling continues with the backlight off; the first key only wakes the
-  screen and is not sent to Kodi.
+- Configurable automatic light sleep (`Off`, `30`, `60` or `90` seconds).
+  The display, keyboard backlight and status LEDs switch off together while
+  Kodi polling continues; the first key only wakes the lights and is not sent
+  to Kodi.
 
 ## Requirements
 
