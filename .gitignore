@@ -3,6 +3,7 @@ managed_components/
 esp-idf/
 esp-idf-tools/
 badgelink_v020/
+.submodules_update_done
 
 .claude/
 .vscode/

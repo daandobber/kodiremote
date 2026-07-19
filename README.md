@@ -13,7 +13,10 @@ Kodi side beyond what Kodi already ships with.
   (small and big steps).
 - Volume up/down on the side buttons, plus mute toggle, control Kodi's volume
   directly.
-- Now-playing screen: title, artist/show, progress bar and elapsed/total time.
+- Rich now-playing screen with cover art, title, artist/show, album or
+  year/genre, a smoothly advancing timeline, elapsed/total/remaining time and
+  playback/volume state. Artwork loads in the background, so the remote stays
+  responsive while a cover is being downloaded or decoded.
 - On-device library browser: Movies, TV Shows (season/episode drill-down) and
   Music (artist/album) fetched straight from Kodi's library, with a press of
   Enter starting playback. Two-pane layout: scrollable list on the left, a
@@ -41,6 +44,9 @@ Kodi side beyond what Kodi already ships with.
   Kodi, or just quit Kodi.
 - Host, port and optional HTTP basic-auth credentials are entered on-device
   and stored in NVS, so they survive reboots.
+- Configurable automatic display sleep (`Off`, `30`, `60` or `90` seconds).
+  Kodi polling continues with the backlight off; the first key only wakes the
+  screen and is not sent to Kodi.
 
 ## Requirements
 
@@ -89,6 +95,7 @@ Kodi side beyond what Kodi already ships with.
 | Download | any key (when finished) | Dismiss the result, back to the picker |
 | Settings | type | Edit selected field (host/port/user/password) |
 | Settings | Up/Down | Switch field |
+| Settings | Left/Right | Change display sleep when that field is selected |
 | Settings | Enter | Next field, or save on the last field |
 | Settings | `F2` | Cancel, back to menu |
 

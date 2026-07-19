@@ -17,6 +17,7 @@ typedef struct {
     uint16_t port;
     char     username[KODI_SETTINGS_USER_MAX];
     char     password[KODI_SETTINGS_PASS_MAX];
+    uint16_t display_sleep_seconds;  // 0 disables automatic display sleep
 } kodi_settings_t;
 
 // Loads settings from NVS into 'out'. If nothing is stored yet, 'out' is zeroed

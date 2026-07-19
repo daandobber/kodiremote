@@ -7,6 +7,10 @@
 extern "C" {
 #endif
 
+// Initializes the shared RAM/SD thumbnail-cache guard. Call once before any
+// thumbnail worker tasks are started.
+esp_err_t kodi_thumbnail_init(void);
+
 // Downloads the image at 'path' (a ready-to-GET path on the configured Kodi
 // host, as produced in kodi_library_item_t.thumb_path) and decodes it
 // (JPEG or PNG) to RGB565, scaled to fit within max_w x max_h while
