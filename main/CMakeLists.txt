@@ -6,6 +6,7 @@ endif()
 
 idf_component_register(
 	SRCS
+		"dobber_splash.c"
 		"main.c"
 		"kodi_client.c"
 		"kodi_settings.c"

@@ -8,6 +8,7 @@
 #include "bsp/led.h"
 #include "bsp/power.h"
 #include "driver/gpio.h"
+#include "dobber_splash.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -256,6 +257,11 @@ static void blit(void) {
     if (res != ESP_OK) {
         ESP_LOGE(TAG, "Failed to blit to display: %d", res);
     }
+}
+
+static void show_startup_progress(uint8_t percent) {
+    dobber_splash_render(&fb, percent);
+    blit();
 }
 
 static void set_device_lights_asleep(bool asleep) {
@@ -1699,6 +1705,7 @@ void app_main(void) {
         default: orientation = PAX_O_UPRIGHT; break;
     }
     pax_buf_set_orientation(&fb, orientation);
+    show_startup_progress(20);
 
     if (bsp_display_get_backlight_brightness(&display_awake_brightness) != ESP_OK ||
         display_awake_brightness == 0) {
@@ -1712,13 +1719,12 @@ void app_main(void) {
     }
 
     ESP_ERROR_CHECK(bsp_input_get_queue(&input_event_queue));
+    show_startup_progress(40);
 
     bsp_led_set_pixel(1, 0x0000FF);  // Radio LED: blue while connecting
     bsp_led_send();
 
-    pax_background(&fb, BLACK);
-    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 8, 8, "Connecting to WiFi...");
-    blit();
+    show_startup_progress(55);
 
     if (wifi_remote_initialize() == ESP_OK) {
         wifi_connection_init_stack();
@@ -1742,6 +1748,7 @@ void app_main(void) {
         ESP_LOGE(TAG, "WiFi radio not responding");
     }
     bsp_led_send();
+    show_startup_progress(80);
 
     if (kodi_settings_load(&settings) != ESP_OK) {
         current_screen = SCREEN_SETTINGS;
@@ -1750,6 +1757,7 @@ void app_main(void) {
     settings_before_edit = settings;
     init_settings_fields();
     apply_kodi_config();
+    show_startup_progress(95);
 
     if (current_screen != SCREEN_SETTINGS) {
         poll_kodi_status();
@@ -1758,6 +1766,7 @@ void app_main(void) {
     last_user_activity_us = last_poll_us;
     last_remote_render_us = last_poll_us;
 
+    show_startup_progress(100);
     render();
 
     uint32_t last_seen_status_generation = status_result_generation;
