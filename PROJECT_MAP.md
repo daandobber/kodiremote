@@ -76,9 +76,10 @@
 ## App Behavior
 
 - Menu screen: Remote control / Library / Download media / Power / Settings.
-- Remote screen: on-screen d-pad hint, now-playing title/subtitle/progress
-  bar/volume, polled from Kodi every ~2 seconds while this screen is open.
-  `T` opens the Type-to-Kodi screen.
+- Remote screen: cover art, media details, playback/volume state and a smooth
+  elapsed/remaining timeline. Status is polled from Kodi every ~2 seconds;
+  cover art is fetched and decoded on a dedicated background worker so the
+  controls stay responsive. `T` opens the Type-to-Kodi screen.
 - Library screen: root choice of Movies / TV Shows / Music, then drills down
   (TV Shows > Seasons > Episodes, Music > Artists > Albums) via a small
   navigation stack in `main.c`; Enter on a leaf item calls `Player.Open` and
@@ -111,5 +112,7 @@
   is still no automatic "sync everything at startup".
 - Power screen: Shutdown / Reboot / Hibernate / Suspend the Kodi host, or
   quit Kodi.
-- Settings screen: on-device form for host, port, username, password,
-  persisted to NVS under the `kodiremote` namespace.
+- Settings screen: on-device form for host, port, username, password and
+  automatic display sleep (`Off` / `30` / `60` / `90` seconds), persisted to
+  NVS under the `kodiremote` namespace. While asleep, Kodi polling continues;
+  the first key wakes the backlight without triggering an action.

@@ -8,7 +8,8 @@ static char const NVS_NAMESPACE[] = "kodiremote";
 
 esp_err_t kodi_settings_load(kodi_settings_t* out) {
     memset(out, 0, sizeof(*out));
-    out->port = 8080;
+    out->port                  = 8080;
+    out->display_sleep_seconds = 60;
 
     nvs_handle_t handle;
     esp_err_t    err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
@@ -30,6 +31,11 @@ esp_err_t kodi_settings_load(kodi_settings_t* out) {
     size_t pass_len = sizeof(out->password);
     nvs_get_str(handle, "password", out->password, &pass_len);
 
+    uint16_t sleep_seconds = 60;
+    if (nvs_get_u16(handle, "sleep_s", &sleep_seconds) == ESP_OK) {
+        out->display_sleep_seconds = sleep_seconds;
+    }
+
     nvs_close(handle);
 
     return out->host[0] != '\0' ? ESP_OK : ESP_ERR_NVS_NOT_FOUND;
@@ -46,6 +52,7 @@ esp_err_t kodi_settings_save(const kodi_settings_t* settings) {
     nvs_set_u16(handle, "port", settings->port);
     nvs_set_str(handle, "username", settings->username);
     nvs_set_str(handle, "password", settings->password);
+    nvs_set_u16(handle, "sleep_s", settings->display_sleep_seconds);
 
     err = nvs_commit(handle);
     nvs_close(handle);

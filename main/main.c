@@ -8,6 +8,7 @@
 #include "bsp/led.h"
 #include "bsp/power.h"
 #include "driver/gpio.h"
+#include "dobber_splash.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -57,7 +58,8 @@ typedef enum {
 static void enter_screen(app_screen_t screen);  // forward decl, defined below in "Input handling per screen"
 
 static app_screen_t    current_screen = SCREEN_MENU;
-static kodi_settings_t settings       = {0};
+static kodi_settings_t settings             = {0};
+static kodi_settings_t settings_before_edit = {0};
 
 // Guards kodi_reachable/status/status_valid: written by status_poll_task,
 // read by the UI thread's draw functions. Polling used to run a blocking
@@ -68,6 +70,7 @@ static SemaphoreHandle_t status_mutex          = NULL;
 static bool              kodi_reachable        = false;
 static kodi_status_t     status                = {0};
 static bool              status_valid          = false;
+static int64_t           status_sample_us      = 0;
 static int64_t           last_poll_us          = 0;
 #define POLL_INTERVAL_US (2000 * 1000)
 
@@ -164,6 +167,25 @@ static SemaphoreHandle_t lib_preview_mutex       = NULL;
 static QueueHandle_t     lib_preview_job_queue   = NULL;  // depth 1, xQueueOverwrite: only the latest request matters
 static TaskHandle_t      lib_preview_task        = NULL;
 
+// Now-playing artwork uses its own depth-1 worker queue. A cover download or
+// decode must never hold up remote-control input, and when the track changes
+// only the newest requested image still matters.
+#define NOW_ART_MAX_W 220
+#define NOW_ART_MAX_H 286
+
+typedef struct {
+    char     path[400];
+    uint32_t request_id;
+} now_art_job_t;
+
+static pax_buf_t         now_art_thumb             = {0};
+static char              now_art_requested_path[400] = "";
+static volatile uint32_t now_art_request_id        = 0;
+static volatile uint32_t now_art_result_generation = 0;
+static SemaphoreHandle_t now_art_mutex             = NULL;
+static QueueHandle_t     now_art_job_queue         = NULL;
+static TaskHandle_t      now_art_task              = NULL;
+
 // Type-to-Kodi screen state
 static char type_buffer[128] = "";
 
@@ -203,7 +225,7 @@ static char const* power_items[POWER_ITEM_COUNT] = {
 static int power_selected = 0;
 
 // Settings screen state
-#define SETTINGS_FIELD_COUNT 4
+#define SETTINGS_FIELD_COUNT 5
 typedef struct {
     char*       buf;
     size_t      maxlen;
@@ -216,6 +238,16 @@ static settings_field_t settings_fields[SETTINGS_FIELD_COUNT];
 static int          settings_field_index = 0;
 static char const*  settings_status_line = "";
 
+// Display sleep turns off every user-facing light while networking and Kodi
+// status updates keep running. The first key wakes the lights and is
+// deliberately swallowed so it cannot accidentally control Kodi.
+static int64_t last_user_activity_us       = 0;
+static int64_t last_remote_render_us       = 0;
+static bool    display_asleep              = false;
+static uint8_t display_awake_brightness    = 80;
+static uint8_t keyboard_awake_brightness   = 100;
+static uint8_t led_awake_brightness        = 100;
+
 // ---- Helpers ----
 
 static void blit(void) {
@@ -227,12 +259,52 @@ static void blit(void) {
     }
 }
 
+static void show_startup_progress(uint8_t percent) {
+    dobber_splash_render(&fb, percent);
+    blit();
+}
+
+static void set_device_lights_asleep(bool asleep) {
+    esp_err_t res = bsp_display_set_backlight_brightness(asleep ? 0 : display_awake_brightness);
+    if (res != ESP_OK) ESP_LOGW(TAG, "Failed to set display backlight: %s", esp_err_to_name(res));
+
+    res = bsp_input_set_backlight_brightness(asleep ? 0 : keyboard_awake_brightness);
+    if (res != ESP_OK) ESP_LOGW(TAG, "Failed to set keyboard backlight: %s", esp_err_to_name(res));
+
+    // Changing global LED brightness preserves the current status colour, so
+    // it can be restored on wake without reconstructing the pixel state.
+    res = bsp_led_set_brightness(asleep ? 0 : led_awake_brightness);
+    if (res != ESP_OK) ESP_LOGW(TAG, "Failed to set LED brightness: %s", esp_err_to_name(res));
+}
+
 static void init_settings_fields(void) {
     snprintf(port_str, sizeof(port_str), "%u", settings.port ? settings.port : 8080);
     settings_fields[0] = (settings_field_t){settings.host, sizeof(settings.host), false, "Kodi host / IP"};
     settings_fields[1] = (settings_field_t){port_str, sizeof(port_str), true, "Port"};
     settings_fields[2] = (settings_field_t){settings.username, sizeof(settings.username), false, "Username (optional)"};
     settings_fields[3] = (settings_field_t){settings.password, sizeof(settings.password), false, "Password (optional)"};
+    settings_fields[4] = (settings_field_t){NULL, 0, false, "Display sleep"};
+}
+
+static bool display_sleep_value_valid(uint16_t seconds) {
+    return seconds == 0 || seconds == 30 || seconds == 60 || seconds == 90;
+}
+
+static void cycle_display_sleep(int direction) {
+    static uint16_t const choices[] = {0, 30, 60, 90};
+    size_t                index     = 0;
+    while (index + 1 < sizeof(choices) / sizeof(choices[0]) &&
+           choices[index] != settings.display_sleep_seconds) {
+        index++;
+    }
+    if (direction > 0) {
+        index = (index + 1) % (sizeof(choices) / sizeof(choices[0]));
+    } else {
+        index = (index + sizeof(choices) / sizeof(choices[0]) - 1) %
+                (sizeof(choices) / sizeof(choices[0]));
+    }
+    settings.display_sleep_seconds = choices[index];
+    last_user_activity_us           = esp_timer_get_time();
 }
 
 static void apply_kodi_config(void) {
@@ -373,6 +445,51 @@ static void lib_preview_worker_task(void* arg) {
         }
         xSemaphoreGive(lib_preview_mutex);
     }
+}
+
+static void now_art_worker_task(void* arg) {
+    (void)arg;
+    now_art_job_t job;
+    while (1) {
+        if (xQueueReceive(now_art_job_queue, &job, portMAX_DELAY) != pdTRUE) continue;
+
+        pax_buf_t decoded = {0};
+        if (job.path[0] != '\0') {
+            kodi_thumbnail_fetch(job.path, NOW_ART_MAX_W, NOW_ART_MAX_H, &decoded);
+        }
+
+        xSemaphoreTake(now_art_mutex, portMAX_DELAY);
+        if (job.request_id == now_art_request_id) {
+            kodi_thumbnail_free(&now_art_thumb);
+            now_art_thumb = decoded;
+            now_art_result_generation++;
+        } else {
+            kodi_thumbnail_free(&decoded);
+        }
+        xSemaphoreGive(now_art_mutex);
+    }
+}
+
+static void now_art_request(char const* path) {
+    if (path == NULL) path = "";
+    if (strcmp(now_art_requested_path, path) == 0) return;
+
+    snprintf(now_art_requested_path, sizeof(now_art_requested_path), "%s", path);
+    now_art_request_id++;
+
+    // Never leave the previous track's cover on screen while the new one is
+    // loading. An empty path is a complete request by itself and needs no job.
+    xSemaphoreTake(now_art_mutex, portMAX_DELAY);
+    kodi_thumbnail_free(&now_art_thumb);
+    xSemaphoreGive(now_art_mutex);
+    if (path[0] == '\0') {
+        now_art_result_generation++;
+        return;
+    }
+
+    now_art_job_t job = {.request_id = now_art_request_id};
+    snprintf(job.path, sizeof(job.path), "%s", path);
+    if (now_art_job_queue != NULL) xQueueOverwrite(now_art_job_queue, &job);
 }
 
 static void lib_reset_preview(void) {
@@ -591,7 +708,7 @@ static void download_run_category(esp_err_t (*fetch_all)(kodi_library_item_t**, 
 
     for (int i = 0; i < count && !download_cancel_requested; i++) {
         char label[96];
-        snprintf(label, sizeof(label), "%s: %s", what, items[i].label);
+        snprintf(label, sizeof(label), "%.*s: %.*s", 20, what, 72, items[i].label);
         download_set_progress(i + 1, count, label);
         if (items[i].thumb_path[0] != '\0') {
             kodi_thumbnail_precache(items[i].thumb_path);
@@ -700,69 +817,133 @@ static void format_time(char* out, size_t out_size, int h, int m, int s) {
     }
 }
 
+static void format_seconds(char* out, size_t out_size, int seconds) {
+    if (seconds < 0) seconds = 0;
+    format_time(out, out_size, seconds / 3600, (seconds / 60) % 60, seconds % 60);
+}
+
+static int status_time_seconds(kodi_status_t const* s) {
+    return s->time_hours * 3600 + s->time_minutes * 60 + s->time_seconds;
+}
+
+static int status_total_seconds(kodi_status_t const* s) {
+    return s->total_hours * 3600 + s->total_minutes * 60 + s->total_seconds;
+}
+
+static char const* media_type_label(char const* type) {
+    if (strcmp(type, "song") == 0) return "MUSIC";
+    if (strcmp(type, "episode") == 0) return "TV EPISODE";
+    if (strcmp(type, "movie") == 0) return "MOVIE";
+    if (strcmp(type, "musicvideo") == 0) return "MUSIC VIDEO";
+    return "NOW PLAYING";
+}
+
+static void draw_wrapped_text(pax_col_t color, pax_font_t const* font, float font_size, float x, float y,
+                              float max_width, float line_height, char const* text, int max_lines);
+
 static void draw_remote_screen(void) {
     pax_background(&fb, BLACK);
-    draw_header("Remote control");
+    draw_header("Now playing");
 
-    float w  = pax_buf_get_width(&fb);
-    float h  = pax_buf_get_height(&fb);
-    float cx = w / 2;
-    float cy = 36 + (h - 36 - 28) / 2 - 40;
-
-    // D-pad hint graphic
-    float pad = 70;
-    pax_outline_rect(&fb, GREY, cx - pad, cy - pad, pad * 2, pad * 2);
-    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, cx - 4, cy - pad - 20, "^");
-    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, cx - 4, cy + pad + 4, "v");
-    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, cx - pad - 16, cy - 8, "<");
-    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, cx + pad + 4, cy - 8, ">");
-    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, cx - 12, cy - 8, "OK");
+    float w = pax_buf_get_width(&fb);
+    float h = pax_buf_get_height(&fb);
 
     xSemaphoreTake(status_mutex, portMAX_DELAY);
-    bool          reachable    = kodi_reachable;
-    bool          valid        = status_valid;
-    kodi_status_t status_copy  = status;
+    bool          reachable   = kodi_reachable;
+    bool          valid       = status_valid;
+    kodi_status_t status_copy = status;
+    int64_t       sample_us   = status_sample_us;
     xSemaphoreGive(status_mutex);
 
-    float info_y = cy + pad + 40;
     if (!kodi_client_is_configured()) {
-        pax_draw_text(&fb, RED, pax_font_sky_mono, 16, 12, info_y, "No Kodi host configured (see Settings)");
+        now_art_request("");
+        pax_draw_text(&fb, RED, pax_font_sky_mono, 18, 28, 76, "No Kodi host configured");
+        pax_draw_text(&fb, GREY, pax_font_sky_mono, 15, 28, 110, "Open Settings to connect this remote.");
     } else if (!reachable) {
-        pax_draw_text(&fb, RED, pax_font_sky_mono, 16, 12, info_y, "Kodi host unreachable");
+        now_art_request("");
+        pax_draw_text(&fb, RED, pax_font_sky_mono, 18, 28, 76, "Kodi host unreachable");
+        pax_draw_text(&fb, GREY, pax_font_sky_mono, 15, 28, 110, "F3 retry  /  F2 menu");
     } else if (valid && status_copy.playing) {
-        char title_line[160];
-        snprintf(title_line, sizeof(title_line), "%s", status_copy.title[0] ? status_copy.title : "(unknown title)");
-        pax_draw_text(&fb, WHITE, pax_font_saira_regular, 18, 12, info_y, title_line);
+        now_art_request(status_copy.thumbnail_path);
 
-        if (status_copy.subtitle[0]) {
-            pax_draw_text(&fb, GREY, pax_font_sky_mono, 14, 12, info_y + 24, status_copy.subtitle);
+        float art_x = 20, art_y = 54, art_box_w = 228, art_box_h = 306;
+        pax_simple_rect(&fb, DARKGREY, art_x, art_y, art_box_w, art_box_h);
+
+        xSemaphoreTake(now_art_mutex, portMAX_DELAY);
+        bool has_art = now_art_thumb.buf != NULL;
+        if (has_art) {
+            float art_w = pax_buf_get_width(&now_art_thumb);
+            float art_h = pax_buf_get_height(&now_art_thumb);
+            pax_draw_image(&fb, &now_art_thumb, art_x + (art_box_w - art_w) / 2, art_y + (art_box_h - art_h) / 2);
+        }
+        xSemaphoreGive(now_art_mutex);
+        if (!has_art) {
+            pax_outline_rect(&fb, GREY, art_x + 12, art_y + 12, art_box_w - 24, art_box_h - 24);
+            pax_draw_text(&fb, GREY, pax_font_saira_regular, 28, art_x + 78, art_y + 132, "KODI");
         }
 
-        // Progress bar
-        float bar_x = 12, bar_y = info_y + 48, bar_w = w - 24, bar_h = 10;
-        pax_outline_rect(&fb, GREY, bar_x, bar_y, bar_w, bar_h);
-        float fill = bar_w * (float)(status_copy.percentage / 100.0);
-        if (fill > bar_w) fill = bar_w;
-        if (fill < 0) fill = 0;
-        pax_simple_rect(&fb, GREEN, bar_x, bar_y, fill, bar_h);
+        float info_x = 276;
+        float info_w = w - info_x - 24;
+        pax_draw_text(&fb, BLUE, pax_font_sky_mono, 14, info_x, 58, media_type_label(status_copy.media_type));
+        if (status_copy.paused) {
+            pax_draw_text(&fb, YELLOW, pax_font_sky_mono, 14, w - 92, 58, "PAUSED");
+        }
 
-        char cur[16], tot[16], time_line[48];
-        format_time(cur, sizeof(cur), status_copy.time_hours, status_copy.time_minutes, status_copy.time_seconds);
-        format_time(tot, sizeof(tot), status_copy.total_hours, status_copy.total_minutes, status_copy.total_seconds);
-        snprintf(time_line, sizeof(time_line), "%s / %s%s", cur, tot, status_copy.paused ? "  (paused)" : "");
-        pax_draw_text(&fb, GREY, pax_font_sky_mono, 14, 12, bar_y + 16, time_line);
+        pax_clip(&fb, (int)info_x, 0, (int)info_w, (int)h);
+        draw_wrapped_text(WHITE, pax_font_saira_regular, 30, info_x, 84, info_w, 38,
+                          status_copy.title[0] ? status_copy.title : "Unknown title", 2);
+        if (status_copy.subtitle[0]) {
+            pax_draw_text(&fb, WHITE, pax_font_sky_mono, 17, info_x, 166, status_copy.subtitle);
+        }
+        if (status_copy.detail[0]) {
+            pax_draw_text(&fb, GREY, pax_font_sky_mono, 14, info_x, 194, status_copy.detail);
+        }
+        pax_noclip(&fb);
 
-        char vol_line[48];
-        snprintf(vol_line, sizeof(vol_line), "Volume: %d%%%s", status_copy.volume, status_copy.muted ? " (muted)" : "");
-        pax_draw_text(&fb, GREY, pax_font_sky_mono, 14, 12, bar_y + 36, vol_line);
+        int elapsed = status_time_seconds(&status_copy);
+        int total   = status_total_seconds(&status_copy);
+        if (!status_copy.paused && sample_us > 0) {
+            int64_t since_sample = (esp_timer_get_time() - sample_us) / 1000000;
+            if (since_sample > 0 && since_sample < 30) elapsed += (int)since_sample;
+        }
+        if (total > 0 && elapsed > total) elapsed = total;
+
+        float bar_x = info_x, bar_y = 238, bar_w = info_w, bar_h = 14;
+        pax_simple_rect(&fb, DARKGREY, bar_x, bar_y, bar_w, bar_h);
+        float progress = total > 0 ? (float)elapsed / (float)total : (float)(status_copy.percentage / 100.0);
+        if (progress < 0) progress = 0;
+        if (progress > 1) progress = 1;
+        pax_simple_rect(&fb, GREEN, bar_x, bar_y, bar_w * progress, bar_h);
+
+        char elapsed_text[16], total_text[16], remaining_text[16], time_line[64];
+        format_seconds(elapsed_text, sizeof(elapsed_text), elapsed);
+        format_seconds(total_text, sizeof(total_text), total);
+        format_seconds(remaining_text, sizeof(remaining_text), total > elapsed ? total - elapsed : 0);
+        if (total > 0) {
+            snprintf(time_line, sizeof(time_line), "%s  /  %s       -%s", elapsed_text, total_text, remaining_text);
+        } else {
+            snprintf(time_line, sizeof(time_line), "%s", elapsed_text);
+        }
+        pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, bar_x, bar_y + 24, time_line);
+
+        char volume_line[64];
+        snprintf(volume_line, sizeof(volume_line), "VOLUME %d%%%s", status_copy.volume,
+                 status_copy.muted ? "  /  MUTED" : "");
+        pax_draw_text(&fb, GREY, pax_font_sky_mono, 15, info_x, 310, volume_line);
+        pax_simple_line(&fb, DARKGREY, info_x, 342, w - 24, 342);
+        pax_draw_text(&fb, GREY, pax_font_sky_mono, 14, info_x, 360, "SPACE  play/pause     S  stop");
+        pax_draw_text(&fb, GREY, pax_font_sky_mono, 14, info_x, 386, "P/N  previous/next    I  info");
     } else {
-        char vol_line[48];
-        snprintf(vol_line, sizeof(vol_line), "Nothing playing. Volume: %d%%%s", status_copy.volume,
-                 status_copy.muted ? " (muted)" : "");
-        pax_draw_text(&fb, GREY, pax_font_sky_mono, 16, 12, info_y, vol_line);
+        now_art_request("");
+        pax_draw_text(&fb, WHITE, pax_font_saira_regular, 28, 28, 76, "Nothing playing");
+        char volume_line[64];
+        snprintf(volume_line, sizeof(volume_line), "Kodi is ready  /  Volume %d%%%s", status_copy.volume,
+                 status_copy.muted ? "  /  muted" : "");
+        pax_draw_text(&fb, GREY, pax_font_sky_mono, 16, 28, 122, volume_line);
+        pax_draw_text(&fb, GREY, pax_font_sky_mono, 15, 28, 180, "Use the arrow keys and Enter to navigate Kodi.");
     }
 
-    draw_footer_hints("Arrows nav  Space play  M mute  T type text  F2 menu");
+    draw_footer_hints("Arrows navigate  Enter select  Space play  M mute  T type  F2 menu");
     blit();
 }
 
@@ -784,12 +965,17 @@ static void draw_wrapped_text(pax_col_t color, pax_font_t const* font, float fon
         if (word_len == 0) break;
         if (word_len > 96) word_len = 96;  // clamp so snprintf's static bounds check is satisfiable
 
-        char candidate[192];
-        if (line[0] == '\0') {
-            snprintf(candidate, sizeof(candidate), "%.*s", word_len, word);
-        } else {
-            snprintf(candidate, sizeof(candidate), "%s %.*s", line, word_len, word);
+        char   candidate[192];
+        size_t candidate_len = 0;
+        if (line[0] != '\0') {
+            candidate_len = strnlen(line, sizeof(candidate) - 1);
+            memcpy(candidate, line, candidate_len);
+            if (candidate_len < sizeof(candidate) - 1) candidate[candidate_len++] = ' ';
         }
+        size_t available = sizeof(candidate) - candidate_len - 1;
+        size_t copy_len  = (size_t)word_len < available ? (size_t)word_len : available;
+        memcpy(candidate + candidate_len, word, copy_len);
+        candidate[candidate_len + copy_len] = '\0';
 
         pax_vec2f size = pax_text_size(font, font_size, candidate);
         if (size.x > max_width && line[0] != '\0') {
@@ -1028,9 +1214,17 @@ static void draw_settings_screen(void) {
         pax_col_t box_color = active ? BLUE : DARKGREY;
         pax_outline_rect(&fb, box_color, 16, y + 18, w - 32, 32);
 
-        char masked[KODI_SETTINGS_PASS_MAX];
+        char        masked[KODI_SETTINGS_PASS_MAX];
+        char        sleep_value[24];
         char const* value = settings_fields[i].buf;
-        if (settings_fields[i].buf == settings.password && settings.password[0]) {
+        if (i == SETTINGS_FIELD_COUNT - 1) {
+            if (settings.display_sleep_seconds == 0) {
+                snprintf(sleep_value, sizeof(sleep_value), "Off");
+            } else {
+                snprintf(sleep_value, sizeof(sleep_value), "%u seconds", settings.display_sleep_seconds);
+            }
+            value = sleep_value;
+        } else if (settings_fields[i].buf == settings.password && settings.password[0]) {
             size_t len = strlen(settings.password);
             if (len >= sizeof(masked)) len = sizeof(masked) - 1;
             memset(masked, '*', len);
@@ -1046,7 +1240,7 @@ static void draw_settings_screen(void) {
         pax_draw_text(&fb, YELLOW, pax_font_sky_mono, 14, 16, y + 8, settings_status_line);
     }
 
-    draw_footer_hints("Type to edit  Up/Down field  Enter next/save  F2 cancel");
+    draw_footer_hints("Type to edit  Up/Down field  Left/Right sleep  Enter next/save  F2 cancel");
     blit();
 }
 
@@ -1086,6 +1280,7 @@ static void status_poll_task(void* arg) {
             status         = new_status;
             status_valid   = true;
             kodi_reachable = true;
+            status_sample_us = esp_timer_get_time();
         } else {
             kodi_reachable = false;
         }
@@ -1107,6 +1302,7 @@ static void poll_kodi_status(void) {
 static void enter_screen(app_screen_t screen) {
     current_screen = screen;
     if (screen == SCREEN_SETTINGS) {
+        settings_before_edit = settings;
         init_settings_fields();
         settings_field_index = 0;
         settings_status_line = "";
@@ -1370,6 +1566,7 @@ static void handle_power_navigation(bsp_input_event_args_navigation_t const* nav
 static void save_settings_and_return(void) {
     settings.port = (uint16_t)strtoul(port_str, NULL, 10);
     if (settings.port == 0) settings.port = 8080;
+    if (!display_sleep_value_valid(settings.display_sleep_seconds)) settings.display_sleep_seconds = 60;
 
     esp_err_t err = kodi_settings_save(&settings);
     if (err == ESP_OK) {
@@ -1389,6 +1586,12 @@ static void handle_settings_navigation(bsp_input_event_args_navigation_t const* 
         case BSP_INPUT_NAVIGATION_KEY_DOWN:
             settings_field_index = (settings_field_index + 1) % SETTINGS_FIELD_COUNT;
             break;
+        case BSP_INPUT_NAVIGATION_KEY_LEFT:
+            if (settings_field_index == SETTINGS_FIELD_COUNT - 1) cycle_display_sleep(-1);
+            break;
+        case BSP_INPUT_NAVIGATION_KEY_RIGHT:
+            if (settings_field_index == SETTINGS_FIELD_COUNT - 1) cycle_display_sleep(1);
+            break;
         case BSP_INPUT_NAVIGATION_KEY_RETURN:
         case BSP_INPUT_NAVIGATION_KEY_SELECT:
             if (settings_field_index == SETTINGS_FIELD_COUNT - 1) {
@@ -1399,12 +1602,16 @@ static void handle_settings_navigation(bsp_input_event_args_navigation_t const* 
             break;
         case BSP_INPUT_NAVIGATION_KEY_BACKSPACE: {
             settings_field_t* field = &settings_fields[settings_field_index];
+            if (field->buf == NULL || field->maxlen == 0) break;
             size_t            len   = strlen(field->buf);
             if (len > 0) field->buf[len - 1] = '\0';
             break;
         }
         case BSP_INPUT_NAVIGATION_KEY_F1: bsp_device_restart_to_launcher(); break;
-        case BSP_INPUT_NAVIGATION_KEY_F2: enter_screen(SCREEN_MENU); break;
+        case BSP_INPUT_NAVIGATION_KEY_F2:
+            settings = settings_before_edit;
+            enter_screen(SCREEN_MENU);
+            break;
         default: break;
     }
 }
@@ -1413,6 +1620,7 @@ static void handle_settings_keyboard(bsp_input_event_args_keyboard_t const* kb) 
     char c = kb->ascii;
     if (c == '\b') {
         settings_field_t* field = &settings_fields[settings_field_index];
+        if (field->buf == NULL || field->maxlen == 0) return;
         size_t            len   = strlen(field->buf);
         if (len > 0) field->buf[len - 1] = '\0';
         return;
@@ -1428,6 +1636,7 @@ static void handle_settings_keyboard(bsp_input_event_args_keyboard_t const* kb) 
     if (c < 32 || c > 126) return;  // ignore non-printable
 
     settings_field_t* field = &settings_fields[settings_field_index];
+    if (field->buf == NULL || field->maxlen == 0) return;
     if (field->numeric_only && (c < '0' || c > '9')) return;
 
     size_t len = strlen(field->buf);
@@ -1442,9 +1651,13 @@ static void handle_settings_keyboard(bsp_input_event_args_keyboard_t const* kb) 
 void app_main(void) {
     gpio_install_isr_service(0);
 
+    ESP_ERROR_CHECK(kodi_thumbnail_init());
     lib_preview_mutex     = xSemaphoreCreateMutex();
     lib_preview_job_queue = xQueueCreate(1, sizeof(lib_preview_job_t));
     xTaskCreate(lib_preview_worker_task, "kodi_thumb", 6144, NULL, tskIDLE_PRIORITY + 1, &lib_preview_task);
+    now_art_mutex     = xSemaphoreCreateMutex();
+    now_art_job_queue = xQueueCreate(1, sizeof(now_art_job_t));
+    xTaskCreate(now_art_worker_task, "kodi_now_art", 6144, NULL, tskIDLE_PRIORITY + 1, &now_art_task);
     lib_load_result_mutex = xSemaphoreCreateMutex();
     lib_load_job_queue    = xQueueCreate(1, sizeof(lib_load_job_t));
     xTaskCreate(lib_load_worker_task, "kodi_lib", 6144, NULL, tskIDLE_PRIORITY + 1, &lib_load_task);
@@ -1453,7 +1666,7 @@ void app_main(void) {
     xTaskCreate(kodi_command_worker_task, "kodi_cmd", 4096, NULL, tskIDLE_PRIORITY + 1, &kodi_command_task);
     status_mutex             = xSemaphoreCreateMutex();
     status_poll_request_sem  = xSemaphoreCreateBinary();
-    xTaskCreate(status_poll_task, "kodi_status", 4096, NULL, tskIDLE_PRIORITY + 1, &status_poll_task_handle);
+    xTaskCreate(status_poll_task, "kodi_status", 6144, NULL, tskIDLE_PRIORITY + 1, &status_poll_task_handle);
 
     esp_err_t res = nvs_flash_init();
     if (res == ESP_ERR_NVS_NO_FREE_PAGES || res == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -1465,7 +1678,7 @@ void app_main(void) {
     const bsp_configuration_t bsp_configuration = {
         .display =
             {
-                .requested_color_format = BSP_DISPLAY_COLOR_FORMAT_24_888RGB,
+                .requested_color_format = BSP_DISPLAY_COLOR_FORMAT_16_565RGB,
                 .num_fbs                = 1,
             },
     };
@@ -1479,7 +1692,7 @@ void app_main(void) {
     physical_h_res = display_h_res;
     physical_v_res = display_v_res;
 
-    pax_buf_init(&fb, NULL, display_h_res, display_v_res, PAX_BUF_24_888RGB);
+    pax_buf_init(&fb, NULL, display_h_res, display_v_res, PAX_BUF_16_565RGB);
     pax_buf_reversed(&fb, display_data_endian == BSP_DISPLAY_ENDIAN_BIG);
 
     bsp_display_rotation_t display_rotation = bsp_display_get_default_rotation();
@@ -1492,15 +1705,26 @@ void app_main(void) {
         default: orientation = PAX_O_UPRIGHT; break;
     }
     pax_buf_set_orientation(&fb, orientation);
+    show_startup_progress(20);
+
+    if (bsp_display_get_backlight_brightness(&display_awake_brightness) != ESP_OK ||
+        display_awake_brightness == 0) {
+        display_awake_brightness = 80;
+    }
+    if (bsp_input_get_backlight_brightness(&keyboard_awake_brightness) != ESP_OK) {
+        keyboard_awake_brightness = 100;
+    }
+    if (bsp_led_get_brightness(&led_awake_brightness) != ESP_OK) {
+        led_awake_brightness = 100;
+    }
 
     ESP_ERROR_CHECK(bsp_input_get_queue(&input_event_queue));
+    show_startup_progress(40);
 
     bsp_led_set_pixel(1, 0x0000FF);  // Radio LED: blue while connecting
     bsp_led_send();
 
-    pax_background(&fb, BLACK);
-    pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 8, 8, "Connecting to WiFi...");
-    blit();
+    show_startup_progress(55);
 
     if (wifi_remote_initialize() == ESP_OK) {
         wifi_connection_init_stack();
@@ -1524,21 +1748,29 @@ void app_main(void) {
         ESP_LOGE(TAG, "WiFi radio not responding");
     }
     bsp_led_send();
+    show_startup_progress(80);
 
     if (kodi_settings_load(&settings) != ESP_OK) {
         current_screen = SCREEN_SETTINGS;
     }
+    if (!display_sleep_value_valid(settings.display_sleep_seconds)) settings.display_sleep_seconds = 60;
+    settings_before_edit = settings;
     init_settings_fields();
     apply_kodi_config();
+    show_startup_progress(95);
 
     if (current_screen != SCREEN_SETTINGS) {
         poll_kodi_status();
     }
     last_poll_us = esp_timer_get_time();
+    last_user_activity_us = last_poll_us;
+    last_remote_render_us = last_poll_us;
 
+    show_startup_progress(100);
     render();
 
     uint32_t last_seen_status_generation = status_result_generation;
+    uint32_t last_seen_art_generation    = now_art_result_generation;
 
     while (1) {
         bsp_input_event_t event;
@@ -1571,42 +1803,58 @@ void app_main(void) {
         // 300ms wake-ups happen between polls and have nothing new to show,
         // so forcing a full-screen redraw+blit for them was pure waste and
         // the main source of this screen feeling laggy.
-        bool should_render = current_screen == SCREEN_DOWNLOAD && download_running;
-        int  drained       = 0;
+        bool should_render           = current_screen == SCREEN_DOWNLOAD && download_running;
+        bool woke_display_this_batch = false;
+        int  drained                 = 0;
 
         while (got_event == pdTRUE) {
-            switch (event.type) {
-                case INPUT_EVENT_TYPE_NAVIGATION:
-                    if (event.args_navigation.state) should_render = true;
-                    // Volume keys always control Kodi volume, regardless of screen.
-                    if (event.args_navigation.state &&
-                        (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_VOLUME_UP ||
-                         event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_VOLUME_DOWN)) {
-                        kodi_cmd(event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_VOLUME_UP ? KCMD_VOLUME_UP
-                                                                                                  : KCMD_VOLUME_DOWN);
-                        break;
-                    }
-                    switch (current_screen) {
-                        case SCREEN_MENU: handle_menu_navigation(&event.args_navigation); break;
-                        case SCREEN_REMOTE: handle_remote_navigation(&event.args_navigation); break;
-                        case SCREEN_LIBRARY: handle_library_navigation(&event.args_navigation); break;
-                        case SCREEN_TYPE: handle_type_navigation(&event.args_navigation); break;
-                        case SCREEN_DOWNLOAD: handle_download_navigation(&event.args_navigation); break;
-                        case SCREEN_POWER: handle_power_navigation(&event.args_navigation); break;
-                        case SCREEN_SETTINGS: handle_settings_navigation(&event.args_navigation); break;
-                    }
-                    break;
-                case INPUT_EVENT_TYPE_KEYBOARD:
+            bool user_activity = (event.type == INPUT_EVENT_TYPE_NAVIGATION && event.args_navigation.state) ||
+                                 event.type == INPUT_EVENT_TYPE_KEYBOARD;
+            if (user_activity) {
+                last_user_activity_us = esp_timer_get_time();
+                if (display_asleep) {
+                    display_asleep = false;
+                    woke_display_this_batch = true;
+                    set_device_lights_asleep(false);
                     should_render = true;
-                    if (current_screen == SCREEN_REMOTE) {
-                        handle_remote_keyboard(&event.args_keyboard);
-                    } else if (current_screen == SCREEN_SETTINGS) {
-                        handle_settings_keyboard(&event.args_keyboard);
-                    } else if (current_screen == SCREEN_TYPE) {
-                        handle_type_keyboard(&event.args_keyboard);
-                    }
-                    break;
-                default: break;
+                }
+            }
+
+            if (!woke_display_this_batch) {
+                switch (event.type) {
+                    case INPUT_EVENT_TYPE_NAVIGATION:
+                        if (event.args_navigation.state) should_render = true;
+                        // Volume keys always control Kodi volume, regardless of screen.
+                        if (event.args_navigation.state &&
+                            (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_VOLUME_UP ||
+                             event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_VOLUME_DOWN)) {
+                            kodi_cmd(event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_VOLUME_UP
+                                         ? KCMD_VOLUME_UP
+                                         : KCMD_VOLUME_DOWN);
+                            break;
+                        }
+                        switch (current_screen) {
+                            case SCREEN_MENU: handle_menu_navigation(&event.args_navigation); break;
+                            case SCREEN_REMOTE: handle_remote_navigation(&event.args_navigation); break;
+                            case SCREEN_LIBRARY: handle_library_navigation(&event.args_navigation); break;
+                            case SCREEN_TYPE: handle_type_navigation(&event.args_navigation); break;
+                            case SCREEN_DOWNLOAD: handle_download_navigation(&event.args_navigation); break;
+                            case SCREEN_POWER: handle_power_navigation(&event.args_navigation); break;
+                            case SCREEN_SETTINGS: handle_settings_navigation(&event.args_navigation); break;
+                        }
+                        break;
+                    case INPUT_EVENT_TYPE_KEYBOARD:
+                        should_render = true;
+                        if (current_screen == SCREEN_REMOTE) {
+                            handle_remote_keyboard(&event.args_keyboard);
+                        } else if (current_screen == SCREEN_SETTINGS) {
+                            handle_settings_keyboard(&event.args_keyboard);
+                        } else if (current_screen == SCREEN_TYPE) {
+                            handle_type_keyboard(&event.args_keyboard);
+                        }
+                        break;
+                    default: break;
+                }
             }
 
             if (++drained >= 32) break;  // safety cap, don't starve the render/poll below forever
@@ -1619,6 +1867,13 @@ void app_main(void) {
                 poll_kodi_status();  // non-blocking dispatch; result picked up below once it lands
                 last_poll_us = now;
             }
+            if (!display_asleep && now - last_remote_render_us >= 1000000) {
+                xSemaphoreTake(status_mutex, portMAX_DELAY);
+                bool timeline_running = status_valid && status.playing && !status.paused;
+                xSemaphoreGive(status_mutex);
+                if (timeline_running) should_render = true;
+                last_remote_render_us = now;
+            }
         }
 
         // Pick up a completed background status poll. Only the Remote and
@@ -1630,11 +1885,25 @@ void app_main(void) {
             if (current_screen == SCREEN_REMOTE || current_screen == SCREEN_MENU) should_render = true;
         }
 
+        if (now_art_result_generation != last_seen_art_generation) {
+            last_seen_art_generation = now_art_result_generation;
+            if (current_screen == SCREEN_REMOTE) should_render = true;
+        }
+
         // Pick up a completed background library fetch.
         if (current_screen == SCREEN_LIBRARY && lib_poll_load_result()) {
             should_render = true;
         }
 
-        if (should_render) render();
+        int64_t now = esp_timer_get_time();
+        if (!display_asleep && settings.display_sleep_seconds > 0 &&
+            now - last_user_activity_us >= (int64_t)settings.display_sleep_seconds * 1000000) {
+            display_asleep = true;
+            should_render  = false;
+            ESP_LOGI(TAG, "Device lights asleep after %u seconds", settings.display_sleep_seconds);
+            set_device_lights_asleep(true);
+        }
+
+        if (should_render && !display_asleep) render();
     }
 }

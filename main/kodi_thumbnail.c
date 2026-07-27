@@ -8,6 +8,8 @@
 #include <sys/stat.h>
 
 #include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "jpeg_decoder.h"
 #include "kodi_client.h"
 #include "miniz.h"
@@ -100,6 +102,21 @@ typedef struct {
 
 static thumb_mem_cache_slot_t g_thumb_mem_cache[THUMB_MEM_CACHE_SLOTS];
 static int                    g_thumb_mem_cache_next = 0;
+static SemaphoreHandle_t      g_thumb_cache_mutex    = NULL;
+
+esp_err_t kodi_thumbnail_init(void) {
+    if (g_thumb_cache_mutex != NULL) return ESP_OK;
+    g_thumb_cache_mutex = xSemaphoreCreateMutex();
+    return g_thumb_cache_mutex != NULL ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+static void thumb_cache_lock(void) {
+    if (g_thumb_cache_mutex != NULL) xSemaphoreTake(g_thumb_cache_mutex, portMAX_DELAY);
+}
+
+static void thumb_cache_unlock(void) {
+    if (g_thumb_cache_mutex != NULL) xSemaphoreGive(g_thumb_cache_mutex);
+}
 
 // Matches on path alone: this app only ever calls kodi_thumbnail_fetch() for
 // a given kind of preview with one fixed max_w/max_h pair, so the actually-
@@ -463,14 +480,19 @@ esp_err_t kodi_thumbnail_fetch(char const* path, int max_w, int max_h, pax_buf_t
     memset(out_thumb, 0, sizeof(*out_thumb));
     if (path == NULL || path[0] == '\0' || max_w <= 0 || max_h <= 0) return ESP_ERR_INVALID_ARG;
 
-    if (thumb_mem_cache_get(path, out_thumb)) return ESP_OK;
+    thumb_cache_lock();
+    bool in_memory = thumb_mem_cache_get(path, out_thumb);
+    thumb_cache_unlock();
+    if (in_memory) return ESP_OK;
 
     char cache_path[96];
     cache_file_path(path, cache_path, sizeof(cache_path));
 
     uint8_t*  data       = NULL;
     size_t    len        = 0;
-    bool      from_cache = read_whole_file(cache_path, &data, &len) == ESP_OK;
+    thumb_cache_lock();
+    bool from_cache = read_whole_file(cache_path, &data, &len) == ESP_OK;
+    thumb_cache_unlock();
 
     if (!from_cache) {
         esp_err_t err = kodi_fetch_binary(path, &data, &len);
@@ -489,10 +511,14 @@ esp_err_t kodi_thumbnail_fetch(char const* path, int max_w, int max_h, pax_buf_t
     // Only cache what we actually downloaded and could decode - never
     // persist a corrupt/partial response.
     if (!from_cache && err == ESP_OK) {
+        thumb_cache_lock();
         write_whole_file(cache_path, data, len);
+        thumb_cache_unlock();
     }
     if (err == ESP_OK) {
+        thumb_cache_lock();
         thumb_mem_cache_put(path, out_thumb);
+        thumb_cache_unlock();
     }
 
     heap_caps_free(data);
@@ -506,7 +532,10 @@ esp_err_t kodi_thumbnail_precache(char const* path) {
     cache_file_path(path, cache_path, sizeof(cache_path));
 
     struct stat st;
-    if (stat(cache_path, &st) == 0 && st.st_size > 0) {
+    thumb_cache_lock();
+    bool already_cached = stat(cache_path, &st) == 0 && st.st_size > 0;
+    thumb_cache_unlock();
+    if (already_cached) {
         return ESP_OK;  // already cached
     }
 
@@ -515,7 +544,9 @@ esp_err_t kodi_thumbnail_precache(char const* path) {
     esp_err_t err  = kodi_fetch_binary(path, &data, &len);
     if (err != ESP_OK) return err;
 
+    thumb_cache_lock();
     write_whole_file(cache_path, data, len);
+    thumb_cache_unlock();
     heap_caps_free(data);
     return ESP_OK;
 }

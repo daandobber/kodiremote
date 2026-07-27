@@ -25,6 +25,9 @@ typedef struct {
     int      active_player_id;
     char     title[128];
     char     subtitle[128];        // artist / show name / album, whichever applies
+    char     media_type[24];       // movie / episode / song / video / ...
+    char     detail[160];          // album, year/genre or another useful secondary line
+    char     thumbnail_path[400];  // ready-to-GET Kodi artwork path, or empty
     double   percentage;           // 0-100
     int      time_hours;
     int      time_minutes;

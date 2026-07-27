@@ -1,5 +1,6 @@
 #include "kodi_client.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -465,6 +466,67 @@ static void extract_now_playing_subtitle(cJSON* item, char* out, size_t out_size
     }
 }
 
+static void percent_encode_into(char const* in, char* out, size_t out_size) {
+    static char const hex[] = "0123456789ABCDEF";
+    size_t            o     = 0;
+    for (size_t i = 0; in[i] != '\0' && o + 4 < out_size; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            out[o++] = (char)c;
+        } else {
+            out[o++] = '%';
+            out[o++] = hex[c >> 4];
+            out[o++] = hex[c & 0x0f];
+        }
+    }
+    out[o] = '\0';
+}
+
+static char const* first_art_value(cJSON* item) {
+    cJSON* thumbnail = cJSON_GetObjectItemCaseSensitive(item, "thumbnail");
+    if (cJSON_IsString(thumbnail) && thumbnail->valuestring[0] != '\0') return thumbnail->valuestring;
+
+    cJSON* art = cJSON_GetObjectItemCaseSensitive(item, "art");
+    if (!cJSON_IsObject(art)) return NULL;
+    static char const* keys[] = {"thumb", "poster", "album.thumb", "tvshow.poster", "season.poster", "fanart"};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        cJSON* value = cJSON_GetObjectItemCaseSensitive(art, keys[i]);
+        if (cJSON_IsString(value) && value->valuestring[0] != '\0') return value->valuestring;
+    }
+    return NULL;
+}
+
+static void extract_now_playing_art(cJSON* item, char* out, size_t out_size) {
+    out[0]               = '\0';
+    char const* art_path = first_art_value(item);
+    if (art_path == NULL) return;
+
+    char encoded[800];
+    percent_encode_into(art_path, encoded, sizeof(encoded));
+    snprintf(out, out_size, "/image/%s", encoded);
+}
+
+static void extract_now_playing_detail(cJSON* item, char const* media_type, char* out, size_t out_size) {
+    out[0] = '\0';
+
+    cJSON* album = cJSON_GetObjectItemCaseSensitive(item, "album");
+    if (strcmp(media_type, "song") == 0 && cJSON_IsString(album) && album->valuestring[0] != '\0') {
+        snprintf(out, out_size, "%s", album->valuestring);
+        return;
+    }
+
+    cJSON* year   = cJSON_GetObjectItemCaseSensitive(item, "year");
+    cJSON* genres = cJSON_GetObjectItemCaseSensitive(item, "genre");
+    cJSON* genre  = cJSON_IsArray(genres) && cJSON_GetArraySize(genres) > 0 ? cJSON_GetArrayItem(genres, 0) : NULL;
+    if (cJSON_IsNumber(year) && year->valueint > 0 && cJSON_IsString(genre)) {
+        snprintf(out, out_size, "%d / %s", year->valueint, genre->valuestring);
+    } else if (cJSON_IsNumber(year) && year->valueint > 0) {
+        snprintf(out, out_size, "%d", year->valueint);
+    } else if (cJSON_IsString(genre)) {
+        snprintf(out, out_size, "%s", genre->valuestring);
+    }
+}
+
 static void extract_time(cJSON* time_obj, int* hours, int* minutes, int* seconds) {
     *hours = *minutes = *seconds = 0;
     if (!time_obj) return;
@@ -523,6 +585,10 @@ esp_err_t kodi_get_status(kodi_status_t* out) {
         cJSON_AddItemToArray(props, cJSON_CreateString("album"));
         cJSON_AddItemToArray(props, cJSON_CreateString("season"));
         cJSON_AddItemToArray(props, cJSON_CreateString("episode"));
+        cJSON_AddItemToArray(props, cJSON_CreateString("year"));
+        cJSON_AddItemToArray(props, cJSON_CreateString("genre"));
+        cJSON_AddItemToArray(props, cJSON_CreateString("thumbnail"));
+        cJSON_AddItemToArray(props, cJSON_CreateString("art"));
         cJSON_AddItemToObject(params, "properties", props);
 
         if (kodi_rpc("Player.GetItem", params, &root) == ESP_OK) {
@@ -544,7 +610,11 @@ esp_err_t kodi_get_status(kodi_status_t* out) {
                 out->player_type = KODI_PLAYER_VIDEO;
             }
 
+            char const* media_type = cJSON_IsString(type) ? type->valuestring : "media";
+            snprintf(out->media_type, sizeof(out->media_type), "%s", media_type);
             extract_now_playing_subtitle(item, out->subtitle, sizeof(out->subtitle));
+            extract_now_playing_detail(item, media_type, out->detail, sizeof(out->detail));
+            extract_now_playing_art(item, out->thumbnail_path, sizeof(out->thumbnail_path));
             cJSON_Delete(root);
         }
     }
